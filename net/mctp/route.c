@@ -11,6 +11,7 @@
  */
 
 #include <linux/idr.h>
+#include <linux/filter.h>
 #include <linux/kconfig.h>
 #include <linux/mctp.h>
 #include <linux/netdevice.h>
@@ -71,6 +72,12 @@ static struct mctp_sock *mctp_lookup_bind_details(struct net *net,
 
 		if (!mctp_address_matches(msk->bind_local_addr, dest))
 			continue;
+
+		if (msk->bind_bpf_filter &&
+		    /* filters return len == 0 to drop */
+			bpf_prog_run_save_cb(msk->bind_bpf_filter, skb) == 0) {
+			continue;
+		}
 
 		return msk;
 	}

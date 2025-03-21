@@ -7,6 +7,7 @@
  */
 
 #include <linux/compat.h>
+#include <linux/filter.h>
 #include <linux/if_arp.h>
 #include <linux/net.h>
 #include <linux/mctp.h>
@@ -121,6 +122,42 @@ static int mctp_bind(struct socket *sock, struct sockaddr *addr, int addrlen)
 
 out_release:
 	release_sock(sk);
+
+	return rc;
+}
+
+static int mctp_bind_filter(struct sock *sk, int bpf_fd)
+{
+	struct mctp_sock *msk = container_of(sk, struct mctp_sock, sk);
+	struct bpf_prog *prog;
+	int rc;
+
+	prog = bpf_prog_get_type(bpf_fd, BPF_PROG_TYPE_SOCKET_FILTER);
+	if (IS_ERR(prog))
+		return PTR_ERR(prog);
+
+	lock_sock(sk);
+
+	if (msk->bind_bpf_filter) {
+		/* already have a filter */
+		rc = -EADDRINUSE;
+		goto out;
+	}
+
+	if (sk_hashed(sk)) {
+		/* bind() already called */
+		rc = -EADDRINUSE;
+		goto out;
+	}
+
+	msk->bind_bpf_filter = prog;
+	rc = 0;
+
+out:
+	release_sock(sk);
+
+	if (rc)
+		bpf_prog_destroy(prog);
 
 	return rc;
 }
@@ -399,6 +436,13 @@ static int mctp_setsockopt(struct socket *sock, int level, int optname,
 			return -EFAULT;
 		msk->addr_ext = val;
 		return 0;
+	}
+	if (optname == MCTP_OPT_BIND_FILTER) {
+		if (optlen != sizeof(int))
+			return -EINVAL;
+		if (copy_from_sockptr(&val, optval, sizeof(int)))
+			return -EFAULT;
+		return mctp_bind_filter(sock->sk, val);
 	}
 
 	return -ENOPROTOOPT;
@@ -697,6 +741,8 @@ static int mctp_sk_init(struct sock *sk)
 	INIT_HLIST_HEAD(&msk->keys);
 	timer_setup(&msk->key_expiry, mctp_sk_expire_keys, 0);
 	msk->bind_peer_set = false;
+	msk->bind_bpf_filter = NULL;
+
 	return 0;
 }
 
@@ -744,7 +790,14 @@ static int mctp_sk_hash(struct sock *sk)
 	/* Bind lookup runs under RCU, remain live during that. */
 	sock_set_flag(sk, SOCK_RCU_FREE);
 
-	sk_add_node_rcu(sk, &net->mctp.binds[hash]);
+	/* Place binds with a BPF filter at the front of the list, so that
+	 * they match prior to less-specific binds without a filter.
+	 */
+	if (msk->bind_bpf_filter)
+		sk_add_node_rcu(sk, &net->mctp.binds[hash]);
+	else
+		sk_add_node_tail_rcu(sk, &net->mctp.binds[hash]);
+
 	rc = 0;
 
 out:
@@ -783,7 +836,17 @@ static void mctp_sk_unhash(struct sock *sk)
 
 static void mctp_sk_destruct(struct sock *sk)
 {
+	struct mctp_sock *msk = container_of(sk, struct mctp_sock, sk);
+
 	skb_queue_purge(&sk->sk_receive_queue);
+
+	/* Remove bpf filter. destruct runs after RCU grace period
+	 * so the filter won't be in-use.
+	 */
+	if (msk->bind_bpf_filter) {
+		bpf_prog_destroy(msk->bind_bpf_filter);
+		msk->bind_bpf_filter = NULL;
+	}
 }
 
 static struct proto mctp_proto = {

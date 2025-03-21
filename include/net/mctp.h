@@ -74,6 +74,7 @@ struct mctp_sock {
 	unsigned int	bind_peer_net;
 	bool		bind_peer_set;
 	__u8		bind_type;
+	struct bpf_prog *bind_bpf_filter;
 
 	/* sendmsg()/recvmsg() uses struct sockaddr_mctp_ext */
 	bool		addr_ext;

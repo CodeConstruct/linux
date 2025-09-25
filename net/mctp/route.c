@@ -36,7 +36,7 @@ static void mctp_flow_prepare_output(struct sk_buff *skb, struct mctp_dev *dev);
 /* route output callbacks */
 static int mctp_dst_discard(struct mctp_dst *dst, struct sk_buff *skb)
 {
-	kfree_skb(skb);
+	kfree_skb_list(skb);
 	return 0;
 }
 
@@ -428,7 +428,7 @@ err_free:
 	return -EINVAL;
 }
 
-static int mctp_dst_input(struct mctp_dst *dst, struct sk_buff *skb)
+static int mctp_dst_input_one(struct mctp_dst *dst, struct sk_buff *skb)
 {
 	struct mctp_sk_key *key, *any_key = NULL;
 	struct net *net = dev_net(skb->dev);
@@ -615,47 +615,82 @@ out:
 	return rc;
 }
 
-static int mctp_dst_output(struct mctp_dst *dst, struct sk_buff *skb)
+static int mctp_dst_input(struct mctp_dst *dst, struct sk_buff *skb)
 {
+	struct sk_buff *next;
+	bool any_ok = false;
+	int tmp, rc = 0;
+
+	while (skb) {
+		next = skb->next;
+		skb_mark_not_on_list(skb);
+
+		tmp = mctp_dst_input_one(dst, skb);
+		if (tmp && !rc) {
+			rc = tmp;
+		} else {
+			any_ok = true;
+		}
+
+		skb = next;
+	}
+
+	return any_ok ? 0 : rc;
+}
+
+static int mctp_dst_output(struct mctp_dst *dst, struct sk_buff *head)
+{
+	struct net_device *dev = dst->dev->dev;
 	char daddr_buf[MAX_ADDR_LEN];
+	struct sk_buff *skb;
 	char *daddr = NULL;
 	int rc;
 
-	skb->protocol = htons(ETH_P_MCTP);
-	skb->pkt_type = PACKET_OUTGOING;
-
-	if (skb->len > dst->mtu) {
-		kfree_skb(skb);
-		return -EMSGSIZE;
-	}
-
 	/* direct route; use the hwaddr we stashed in sendmsg */
 	if (dst->halen) {
-		if (dst->halen != skb->dev->addr_len) {
-			/* sanity check, sendmsg should have already caught this */
-			kfree_skb(skb);
-			return -EMSGSIZE;
+		if (dst->halen != dev->addr_len) {
+			/* sanity check, sendmsg should have already
+			 * caught this
+			 */
+			rc = -EMSGSIZE;
+			goto err_free;
 		}
 		daddr = dst->haddr;
 	} else {
 		/* If lookup fails let the device handle daddr==NULL */
-		if (mctp_neigh_lookup(dst->dev, dst->nexthop, daddr_buf) == 0)
+		if (mctp_neigh_lookup(dst->dev, dst->nexthop,
+				      daddr_buf) == 0)
 			daddr = daddr_buf;
 	}
 
-	rc = dev_hard_header(skb, skb->dev, ntohs(skb->protocol),
-			     daddr, skb->dev->dev_addr, skb->len);
-	if (rc < 0) {
-		kfree_skb(skb);
-		return -EHOSTUNREACH;
+	for (skb = head; skb; skb = skb->next) {
+		if (skb->len > dst->mtu) {
+			rc = -EMSGSIZE;
+			goto err_free;
+		}
+
+		skb->protocol = htons(ETH_P_MCTP);
+		skb->pkt_type = PACKET_OUTGOING;
+		skb->dev = dev;
+
+		rc = dev_hard_header(skb, dev, ntohs(skb->protocol),
+				     daddr, dev->dev_addr, skb->len);
+		if (rc < 0) {
+			rc = -EHOSTUNREACH;
+			goto err_free;
+		}
+
+		mctp_flow_prepare_output(skb, dst->dev);
 	}
 
-	mctp_flow_prepare_output(skb, dst->dev);
-
-	rc = dev_queue_xmit(skb);
+	rc = dev_queue_xmit(head);
 	if (rc)
 		rc = net_xmit_errno(rc);
 
+	return rc;
+
+err_free:
+	kfree_skb_list(head);
 	return rc;
 }
 
@@ -1014,19 +1049,24 @@ static int mctp_route_lookup_null(struct net *net, struct net_device *dev,
 	return rc;
 }
 
-static int mctp_do_fragment_route(struct mctp_dst *dst, struct sk_buff *skb,
-				  unsigned int mtu, u8 tag)
+/* Given a MCTP message in @skb, fragments into mtu-sized MCTP packet
+ * skbs, represented a skb list.
+ *
+ * On error, will have freed @skb (and any intermediate packets that
+ * may have beencreated).
+ */
+static int mctp_fragment(struct sk_buff *skb, unsigned int mtu, u8 tag)
 {
 	const unsigned int hlen = sizeof(struct mctp_hdr);
-	struct mctp_hdr *hdr, *hdr2;
 	unsigned int pos, size, headroom;
-	struct sk_buff *skb2;
+	struct sk_buff *skb2, **tailp;
+	struct mctp_hdr *hdr, *hdr2;
 	int rc;
 	u8 seq;
 
 	hdr = mctp_hdr(skb);
-	seq = 0;
 	rc = 0;
+	tailp = NULL;
 
 	if (mtu < hlen + 1) {
 		kfree_skb(skb);
@@ -1036,17 +1076,25 @@ static int mctp_do_fragment_route(struct mctp_dst *dst, struct sk_buff *skb,
 	/* keep same headroom as the original skb */
 	headroom = skb_headroom(skb);
 
-	/* we've got the header */
-	skb_pull(skb, hlen);
+	hdr->flags_seq_tag = MCTP_HDR_FLAG_SOM |
+		(tag & (MCTP_HDR_TAG_MASK | MCTP_HDR_FLAG_TO));
 
-	for (pos = 0; pos < skb->len;) {
+	if (skb->len <= mtu) {
+		hdr->flags_seq_tag |= MCTP_HDR_FLAG_EOM;
+		return 0;
+	}
+
+	seq = 1;
+	tailp = &skb->next;
+
+	for (pos = mtu; pos < skb->len;) {
 		/* size of message payload */
 		size = min(mtu - hlen, skb->len - pos);
 
 		skb2 = alloc_skb(headroom + hlen + size, GFP_KERNEL);
 		if (!skb2) {
 			rc = -ENOMEM;
-			break;
+			goto err;
 		}
 
 		/* generic skb copy */
@@ -1086,16 +1134,18 @@ static int mctp_do_fragment_route(struct mctp_dst *dst, struct sk_buff *skb,
 		/* we need to copy the extensions, for MCTP flow data */
 		skb_ext_copy(skb2, skb);
 
-		/* do route */
-		rc = dst->output(dst, skb2);
-		if (rc)
-			break;
+		*tailp = skb2;
+		tailp = &skb2->next;
 
 		seq = (seq + 1) & MCTP_HDR_SEQ_MASK;
 		pos += size;
 	}
 
-	consume_skb(skb);
+	skb_trim(skb, mtu);
+	return 0;
+
+err:
+	kfree_skb_list(skb);
 	return rc;
 }
 
@@ -1158,7 +1208,6 @@ int mctp_local_output(struct sock *sk, struct mctp_dst *dst,
 	skb_reset_transport_header(skb);
 	skb_push(skb, sizeof(struct mctp_hdr));
 	skb_reset_network_header(skb);
-	skb->dev = dst->dev->dev;
 
 	/* set up common header fields */
 	hdr = mctp_hdr(skb);
@@ -1171,13 +1220,14 @@ int mctp_local_output(struct sock *sk, struct mctp_dst *dst,
 	if (skb->len + sizeof(struct mctp_hdr) <= mtu) {
 		hdr->flags_seq_tag = MCTP_HDR_FLAG_SOM |
 			MCTP_HDR_FLAG_EOM | tag;
-		rc = dst->output(dst, skb);
 	} else {
-		rc = mctp_do_fragment_route(dst, skb, mtu, tag);
+		rc = mctp_fragment(skb, mtu, tag);
+		if (rc)
+			goto out_release;
 	}
 
 	/* route output functions consume the skb, even on error */
-	skb = NULL;
+	return dst->output(dst, skb);
 
 out_release:
 	kfree_skb(skb);

@@ -95,10 +95,15 @@ static int mctp_test_dst_output(struct mctp_dst *dst, struct sk_buff *skb)
 {
 	struct kunit *test = current->kunit_test;
 	struct mctp_test_pktqueue *tpq = test->priv;
+	struct sk_buff *next;
 
 	KUNIT_ASSERT_EQ(test, tpq->magic, test_pktqueue_magic);
 
-	skb_queue_tail(&tpq->pkts, skb);
+	while (skb) {
+		next = skb->next;
+		skb_queue_tail(&tpq->pkts, skb);
+		skb = next;
+	};
 
 	return 0;
 }

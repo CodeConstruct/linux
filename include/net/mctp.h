@@ -275,6 +275,11 @@ struct mctp_dst {
 	unsigned char halen;
 	unsigned char haddr[MAX_ADDR_LEN];
 
+	/* Perform dst output, for @skb, which may be a list.
+	 *
+	 * Returns non-zero on failure, where all of the skb list cannot
+	 * be routed. If any skb in the list is routed, returns zero.
+	 */
 	int (*output)(struct mctp_dst *dst, struct sk_buff *skb);
 };
 

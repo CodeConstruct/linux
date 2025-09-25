@@ -45,7 +45,10 @@ static void mctp_test_fragment(struct kunit *test)
 
 	mctp_test_dst_setup(test, &dst, dev, &tpq, mtu);
 
-	rc = mctp_do_fragment_route(&dst, skb, mtu, MCTP_TAG_OWNER);
+	rc = mctp_fragment(skb, mtu, MCTP_TAG_OWNER);
+	KUNIT_EXPECT_FALSE(test, rc);
+
+	rc = dst.output(&dst, skb);
 	KUNIT_EXPECT_FALSE(test, rc);
 
 	n = tpq.pkts.qlen;

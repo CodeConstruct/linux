@@ -1,0 +1,17 @@
+
+config OBMF_ICP
+	tristate "Open Boot and Management Framework - Interface Consolidation Protocol"
+	help
+	  Enable support for USB devices implementing OBMF-ICP
+
+if OBMF_ICP
+
+menu "OBMF ICP transport drivers"
+
+endmenu
+
+menu "OMBF ICP channel drivers"
+
+endmenu
+
+endif

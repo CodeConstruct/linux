@@ -1,0 +1,236 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Open Boot Management Framework: Interface Consolidation Protocol (OBMF-ICP)
+ * support.
+ *
+ * Core OBMF-ICP definitions: messaging support, bus type, channel device/driver
+ * implementation
+ *
+ * Copyright (c) 2026 Code Construct
+ */
+
+#include <linux/bitfield.h>
+#include <linux/completion.h>
+#include <linux/types.h>
+#include <linux/usb.h>
+
+/* Base protocol constants */
+#define OBMF_ICP_MTU 0x216
+#define OBMF_ICP_REV 0
+#define OBMF_ICP_CHANNEL_INDEX_DISCOVERY 1
+#define OBMF_ICP_CHANNEL_TYPE_DISCOVERY 0
+#define OBMF_ICP_CHANNEL_TYPE_MMIO 1
+#define OBMF_ICP_CHANNEL_TYPE_GPIO 2
+#define OBMF_ICP_CHANNEL_TYPE_SERIAL 3
+
+#define OBMF_ICP_MSG_HDR_STATUS_FIELD		GENMASK(6, 0)
+#define OBMF_ICP_MSG_HDR_RQRESP_FIELD		BIT(7)
+#define OBMF_ICP_MSG_HDR_RQRESP_VALUE_REQUEST	0
+#define OBMF_ICP_MSG_HDR_RQRESP_VALUE_RESPONSE	1
+
+/* Base message format */
+struct obmf_icp_msg_hdr {
+	u8 channel;
+	u8 status_rq;
+	__le16 size;
+} __packed;
+
+struct obmf_icp_msg {
+	struct obmf_icp_msg_hdr hdr;
+	unsigned char payload[];
+} __packed;
+
+/* Generic status codes, 0x00 - 0x3f. May be augmented with channel-specific
+ * status codes 0x40 - 0x7f.
+ */
+enum obmf_icp_msg_status {
+	OBMF_ICP_MSG_STS_SUCCESS = 0x00,
+	OBMF_ICP_MSG_STS_CMD_PARAM_INVALID = 0x01,
+	OBMF_ICP_MSG_STS_REQ_TIMEOUT = 0x02,
+	OBMF_ICP_MSG_STS_CHAN_NOT_READY = 0x03,
+	OBMF_ICP_MSG_STS_CHAN_PERM_ERR = 0x04,
+	OBMF_ICP_MSG_STS_CHAN_INVALID = 0x05,
+	OBMF_ICP_MSG_STS_REQ_SIZE_INVALID = 0x06,
+};
+
+static inline void obmf_icp_msg_get_status_rq(struct obmf_icp_msg_hdr *hdr,
+					      u8 *status, u8 *rq)
+{
+	u8 status_rq = hdr->status_rq;
+
+	if (status)
+		*status = FIELD_GET(OBMF_ICP_MSG_HDR_STATUS_FIELD, status_rq);
+	if (rq)
+		*rq = FIELD_GET(OBMF_ICP_MSG_HDR_RQRESP_FIELD, status_rq);
+}
+
+/* OBMF-ICP implementation */
+struct obmf_icp;
+struct obmf_icp_tx;
+struct obmf_icp_transport;
+
+struct obmf_icp_transport_ops {
+	/* Initialise a transmit context, @tx. The context is long-running,
+	 * typically around for the life of a channel.
+	 *
+	 * Transport implementations will typically use this to allocate any
+	 * transport-specific tx facilities, and may store in
+	 * tx->transport_data.
+	 *
+	 * Optional.
+	 */
+	int (*tx_init)(struct obmf_icp_transport *transport,
+		       struct obmf_icp_tx *tx);
+
+	/* Finalise a transmit context @tx. Typically the inverse of ->tx_init
+	 *
+	 * Optional.
+	 */
+	void (*tx_fini)(struct obmf_icp_transport *transport,
+			struct obmf_icp_tx *tx);
+
+	/* Submit a tx context for device transmit.
+	 *
+	 * Implementations should send the tx->buf data (of tx->len) length,
+	 * and set tx->status to reflect any transport errors, then
+	 * indicate completion via obmf_icp_transport_tx_complete().
+	 */
+	int (*tx_submit)(struct obmf_icp *icp, struct obmf_icp_tx *tx);
+
+	/* Cancel a tx context
+	 *
+	 * Implementations do not need to trigger a completion on
+	 * cancel.
+	 */
+	void (*tx_cancel)(struct obmf_icp *icp, struct obmf_icp_tx *tx);
+
+	/* Submit an incoming receive, for received data into icp->in_buf.
+	 *
+	 * On receive, the transport impemlementation must call
+	 * obmf_icp_transport_rx_complete() to indicate receive status and
+	 * length. Once the core is ready for further
+	 * received data, it will call ->rx_submit() again.
+	 *
+	 * Will be called from atomic contexts; implementations must not sleep.
+	 *
+	 * The receive context is global to the icp device; only one receive
+	 * is submitted any any time.
+	 */
+	int (*rx_submit)(struct obmf_icp *icp);
+
+	/* Cancel any ongoing submitted receive. */
+	int (*rx_cancel)(struct obmf_icp_transport *transport);
+};
+
+struct obmf_icp_transport {
+	struct obmf_icp *icp;
+	const struct obmf_icp_transport_ops *ops;
+};
+
+/* transport calls in atomic context */
+void obmf_icp_transport_rx_complete(struct obmf_icp *icp, int status,
+				    size_t len);
+
+/* transport updates tx->status, calls in atomic context */
+void obmf_icp_transport_tx_complete(struct obmf_icp *icp,
+				    struct obmf_icp_tx *tx);
+
+void obmf_icp_transport_disconnect(struct obmf_icp_transport *ts);
+
+struct obmf_icp {
+	struct device dev;
+	unsigned int idx;
+
+	/* this includes channel 0, so channels are indexed by their
+	 * on-the-wire channel index in this array
+	 */
+	unsigned int n_channels;
+	struct obmf_icp_channel_device **channels __counted_by(n_channels);
+
+	struct obmf_icp_channel_device *ch0;
+
+	struct obmf_icp_transport *transport;
+
+	/* todo: pool, buffers handed off to channel's rx */
+	u8 in_buf[OBMF_ICP_MTU];
+
+	spinlock_t lock;
+};
+
+int obmf_icp_bus_register(struct obmf_icp *icp);
+void obmf_icp_bus_unregister(struct obmf_icp *icp);
+
+/* channel / device types */
+struct obmf_icp_channel_device {
+	struct device dev;
+
+	u8 idx, type;
+	u32 cfg_ptr;
+	/* channel-specific size, 0 representing only common config */
+	u32 cfg_size;
+	u16 max_req_payload_size;
+	u16 max_resp_payload_size;
+
+	bool enabled;
+
+	struct obmf_icp *icp;
+};
+
+/* context for request / response transmit */
+struct obmf_icp_tx {
+	u8 buf[OBMF_ICP_MTU];
+	size_t len;
+	int status;
+	struct obmf_icp *icp;
+	void *transport_data;
+	struct completion completion;
+};
+
+/* context for request / response receive */
+struct obmf_icp_rx {
+	struct obmf_icp_channel_device *chan;
+	u8 buf[OBMF_ICP_MTU];
+	size_t len;
+	int status;
+	struct completion completion;
+};
+
+struct obmf_icp_channel_device_id {
+	unsigned int match_flags;
+	u8 type;
+};
+
+#define OBMF_ICP_DEV_MATCH_TYPE 0x1
+
+#define OBMF_ICP_DEV_ID_TYPE(t) { \
+	     .match_flags = OBMF_ICP_DEV_MATCH_TYPE, \
+	     .type = (t), \
+	}
+
+struct obmf_icp_channel_driver {
+	struct device_driver drv;
+	const struct obmf_icp_channel_device_id *id_table;
+
+	int (*probe)(struct obmf_icp_channel_device *dev);
+	void (*remove)(struct obmf_icp_channel_device *dev);
+};
+
+int obmf_icp_channel_driver_register(struct obmf_icp_channel_driver *drv);
+void obmf_icp_channel_driver_unregister(struct obmf_icp_channel_driver *drv);
+
+#define module_obmf_icp_channel_driver(__obmf_icp_channel_driver) \
+		module_driver(__obmf_icp_channel_driver, \
+			      obmf_icp_channel_driver_register, \
+			      obmf_icp_channel_driver_unregister)
+
+static inline void *
+ombf_icp_get_drvdata(struct obmf_icp_channel_device *dev)
+{
+	return dev_get_drvdata(&dev->dev);
+}
+
+static inline void
+obmf_icp_set_drvdata(struct obmf_icp_channel_device *dev, void *data)
+{
+	dev_set_drvdata(&dev->dev, data);
+}

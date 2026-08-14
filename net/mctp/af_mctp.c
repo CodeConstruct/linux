@@ -425,6 +425,39 @@ static int mctp_getsockopt(struct socket *sock, int level, int optname,
 		return 0;
 	}
 
+	if (optname == MCTP_OPT_ROUTE_SRCADDR) {
+		struct mctp_route_srcaddr rsa;
+		struct mctp_dst dst;
+		unsigned int net;
+		int rc;
+
+		if (len != sizeof(rsa))
+			return -EINVAL;
+
+		if (copy_from_user(&rsa, optval, sizeof(rsa)))
+			return -EFAULT;
+
+		net = rsa.net;
+		if (net == MCTP_NET_ANY)
+			net = mctp_default_net(sock_net(sock->sk));
+
+		rc = mctp_route_lookup(sock_net(sock->sk), net, rsa.daddr, &dst);
+		if (rc)
+			return rc;
+
+		rsa.saddr = dst.saddr;
+		mctp_dst_release(&dst);
+
+		if (rsa.saddr == MCTP_ADDR_NULL)
+			return -EADDRNOTAVAIL;
+
+		if (put_user(sizeof(rsa), optlen))
+			return -EFAULT;
+		if (copy_to_user(optval, &rsa, sizeof(rsa)))
+			return -EFAULT;
+		return 0;
+	}
+
 	return -ENOPROTOOPT;
 }
 

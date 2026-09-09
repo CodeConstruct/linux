@@ -24,6 +24,17 @@ endmenu
 
 menu "OMBF ICP channel drivers"
 
+config OBMF_ICP_GPIO
+	tristate "GPIO channel driver"
+	depends on GPIOLIB
+	select GPIOLIB_IRQCHIP
+	help
+	  Driver for OBMF-ICP General-Purpose IO (GPIO) channels.
+
+	  This driver implements a standard Linux gpiochip over an OBMF-ICP
+	  gpio-type channel.
+
+	  If unsure, say 'n'
 endmenu
 
 endif

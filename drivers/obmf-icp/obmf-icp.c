@@ -18,6 +18,7 @@
 #include <linux/printk.h>
 #include <linux/spinlock.h>
 #include <linux/usb.h>
+#include <linux/workqueue.h>
 
 #include "obmf-icp.h"
 
@@ -113,6 +114,39 @@ static void obmf_icp_channel_device_release(struct device *dev)
 
 	kfree(chan);
 }
+
+static void obmf_icp_responder_msg_work(struct work_struct *work)
+{
+	struct obmf_icp_responder *rsp = container_of(work,
+						      struct obmf_icp_responder,
+						      msg_work);
+	struct obmf_icp_channel_device *chan = rsp->chan;
+	u8 status;
+	int rc;
+
+	rsp->tx.len = 0;
+
+	status = rsp->msg_fn(chan, rsp);
+
+	/* We are done with the RX data; clear in_use for new incoming
+	 * requests, which may arrive any time after transmissing the
+	 * response.
+	 */
+	atomic_set_release(&rsp->in_use, false);
+
+	if (status) {
+		obmf_icp_format_response_error(chan, rsp, status);
+	} else if (!rsp->tx.len) {
+		dev_warn(&chan->dev,
+			"channel responder did not format a response?");
+		return;
+	}
+
+	rc = obmf_icp_responder_tx(chan->icp, rsp);
+	if (rc)
+		dev_warn(&chan->dev, "can't tx response %d\n", rc);
+}
+
 
 int obmf_icp_channel_init_requester(struct obmf_icp_channel_device *chan)
 {
@@ -249,6 +283,95 @@ obmf_icp_channel_init(struct obmf_icp *icp, u8 idx)
 	return chan;
 }
 
+int obmf_icp_channel_init_responder(struct obmf_icp_channel_device *chan,
+				    obmf_icp_responder_msg_fn msg_fn)
+{
+	struct obmf_icp_transport *ts = chan->icp->transport;
+	struct obmf_icp_responder *rsp;
+
+	rsp = devm_kmalloc(&chan->dev, sizeof(*rsp), GFP_KERNEL);
+	if (!rsp)
+		return -ENOMEM;
+
+	init_completion(&rsp->tx.completion);
+	init_completion(&rsp->rx.completion);
+
+	rsp->chan = chan;
+	rsp->msg_fn = msg_fn;
+	atomic_set_release(&rsp->in_use, false);
+	INIT_WORK(&rsp->msg_work, obmf_icp_responder_msg_work);
+
+	if (ts->ops->tx_init) {
+		int rc = ts->ops->tx_init(ts, &rsp->tx);
+		if (rc) {
+			dev_err(&chan->dev, "tx init failed: %d\n", rc);
+			return rc;
+		}
+	}
+
+	rsp->rx.chan = chan;
+	chan->rsp = rsp;
+
+	return 0;
+}
+
+/* len is total message length, including ICP header. returns a payload
+ * pointer, of @payload_len bytes
+ */
+void *obmf_icp_format_response(struct obmf_icp_channel_device *chan,
+			      struct obmf_icp_responder *rsp, u8 status,
+			      size_t payload_len)
+{
+	u8 status_rq = FIELD_PREP(OBMF_ICP_MSG_HDR_STATUS_FIELD, status) |
+		FIELD_PREP(OBMF_ICP_MSG_HDR_RQRESP_FIELD,
+			   OBMF_ICP_MSG_HDR_RQRESP_VALUE_RESPONSE);
+
+	return obmf_icp_format_tx(chan, &rsp->tx, status_rq, payload_len);
+}
+
+void obmf_icp_format_response_error(struct obmf_icp_channel_device *chan,
+				    struct obmf_icp_responder *rsp,
+				    u8 status)
+{
+	/* format_response() is infallible with a zero payload length */
+	obmf_icp_format_response(chan, rsp, status, 0);
+}
+
+/* returns a payload pointer, of len *lenp */
+void *obmf_icp_get_request(struct obmf_icp_responder *rsp,
+			    u8 *statusp, size_t *lenp)
+{
+	return obmf_icp_get_rx(&rsp->rx, statusp, lenp);
+}
+
+/* todo: sequencing with msg_fn */
+int obmf_icp_responder_tx(struct obmf_icp *icp,
+			  struct obmf_icp_responder *rsp)
+{
+	struct obmf_icp_tx *tx = &rsp->tx;
+	int rc;
+
+	reinit_completion(&tx->completion);
+
+	rc = icp->transport->ops->tx_submit(icp, tx);
+	if (rc)
+		return rc;
+
+	rc = wait_for_completion_interruptible(&tx->completion);
+	if (rc) {
+		if (icp->transport->ops->tx_cancel)
+			icp->transport->ops->tx_cancel(icp, tx);
+		return -EPROTO;
+	}
+
+	if (tx->status != 0) {
+		dev_warn(&icp->dev, "tx status %d\n", tx->status);
+		return tx->status;
+	}
+
+	return 0;
+}
+
 static void __obmf_icp_handle_rx(struct obmf_icp *icp, size_t len)
 {
 	struct obmf_icp_channel_device *chan;
@@ -280,10 +403,25 @@ static void __obmf_icp_handle_rx(struct obmf_icp *icp, size_t len)
 	}
 
 	if (rq) {
-		dev_err(dev,
-			"responder not implemented, channel %d\n",
-			chan_idx);
-		return;
+		struct obmf_icp_responder *rsp = chan->rsp;
+		if (!rsp) {
+			dev_err(dev,
+				"invalid request for non-responder channel %d\n",
+				chan_idx);
+			return;
+		}
+
+		if (atomic_cmpxchg(&rsp->in_use, false, true)) {
+			dev_err(dev,
+				"multiple incoming requests for responder channel %d\n",
+				chan_idx);
+			return;
+		}
+
+		rsp->rx.len = len;
+		memcpy(rsp->rx.buf, icp->in_buf, rsp->rx.len);
+		// TODO: workqueue for icp?
+		schedule_work(&rsp->msg_work);
 	} else {
 		struct obmf_icp_requester *req = chan->req;
 

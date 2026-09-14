@@ -54,8 +54,9 @@ Requesters and responders
 
 As per the OBMF-ICP spec, a channel may implement a requester, a responder,
 or both. The obmf-icp core provides a facility to create a struct
-obmf_icp_requester for each channel, which provides a facility to construct
-requests to the remote OBMF-ICP endpoint.
+obmf_icp_requester and/or a struct obmf_icp_responder for each channel, which
+provides a facility to construct requests to and receive requests from
+the remote OBMF-ICP endpoint
 
 Requesters
 ----------
@@ -146,3 +147,34 @@ Response data
 Once obmf_icp_requester_txn() has completed, a driver can access the response
 data through obmf_icp_get_response(). This provides access to the
 response status directly, and a pointer to the response payload.
+
+Responders
+----------
+
+Just like with the requester functionality: on probe, a channel driver will
+create a responder using obmf_icp_channel_init_responder(). This responder
+will invoke the passed function pointer on incoming requests.
+
+This function pointer is responsible for interpreting the incoming request,
+performing some device action, and forming the outgoing response. The
+obmf-icp core will arrange for transmission of the formed response.
+
+The callback is invoked in sleepable context. However, only one request can
+be pending (per channel) at a time, so the requester will be blocked from
+issuing further requests until the response has been received.
+
+To handle requests from the channel device, a driver implementation's
+responder callback should:
+
+ - read the request data through obmf_icp_get_request()
+
+ - validate for size and data
+
+ - perform any request-specific logic
+
+ - format the response data, using obmf_icp_format_response(), or a typed
+   helper
+
+Like the request helpers, there is an equivalents for fixed-size responses
+in obmf_icp_format_response_typed() and for header + entries responses in
+obmf_icp_format_response_flex().

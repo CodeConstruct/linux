@@ -161,6 +161,7 @@ int obmf_icp_bus_register(struct obmf_icp *icp);
 void obmf_icp_bus_unregister(struct obmf_icp *icp);
 
 struct obmf_icp_requester;
+struct obmf_icp_responder;
 
 /* channel / device types */
 struct obmf_icp_channel_device {
@@ -176,9 +177,12 @@ struct obmf_icp_channel_device {
 	bool enabled;
 
 	struct obmf_icp *icp;
+	void *chan_priv;
 
 	/* access via obmf_icp_channel_get_requester() */
 	struct obmf_icp_requester *req;
+	/* access via obmf_icp_channel_get_responder() */
+	struct obmf_icp_responder *rsp;
 };
 
 /* context for request / response transmit */
@@ -206,6 +210,37 @@ struct obmf_icp_requester {
 	struct obmf_icp_tx tx;
 	struct obmf_icp_rx rx;
 	void *transport_data;
+};
+
+/* Callback for incoming messages to a responder.
+ *
+ * The responder's RX data is populated from the incoming message, but
+ * will be overwritten after msg_fn completes. Implementations that use
+ * the message data outside the scope of the function will need to take a
+ * copy.
+ *
+ * Implementations will typically prepare their response into the responder
+ * tx. The TX will be initiated after msg_fn completion, using the
+ * prepared message.
+ *
+ * On a non-zero return, the return value will be used to construct an
+ * error response, with no payload, using the provided status code. On
+ * zero return, the message is transmitted as-is, so much have been
+ * prepared by the implementation.
+ *
+ * Called in workqueue context; implementations may sleep.
+ */
+typedef u8 (*obmf_icp_responder_msg_fn)(
+	struct obmf_icp_channel_device *chan,
+	struct obmf_icp_responder *rsp);
+
+struct obmf_icp_responder {
+	struct obmf_icp_channel_device *chan;
+	struct obmf_icp_rx rx;
+	struct obmf_icp_tx tx;
+	atomic_t in_use;
+	struct work_struct msg_work;
+	obmf_icp_responder_msg_fn msg_fn;
 };
 
 struct obmf_icp_channel_device_id {
@@ -249,6 +284,8 @@ obmf_icp_set_drvdata(struct obmf_icp_channel_device *dev, void *data)
 }
 
 int obmf_icp_channel_init_requester(struct obmf_icp_channel_device *chan);
+int obmf_icp_channel_init_responder(struct obmf_icp_channel_device *chan,
+				    obmf_icp_responder_msg_fn msg_fn);
 
 int obmf_icp_requester_txn(struct obmf_icp *icp,
 			   struct obmf_icp_requester *req);
@@ -261,6 +298,11 @@ void obmf_icp_channel_put_requester(struct obmf_icp_requester *req);
 void *obmf_icp_format_request(struct obmf_icp_channel_device *chan,
 			      struct obmf_icp_requester *req,
 			      size_t payload_len);
+
+/* returns a payload pointer, of len *lenp */
+void *obmf_icp_get_request(struct obmf_icp_responder *rsp,
+			    u8 *statusp, size_t *lenp);
+
 
 #define obmf_icp_format_request_typed(c, r, ty) \
 ({ \
@@ -278,3 +320,28 @@ void *obmf_icp_format_request(struct obmf_icp_channel_device *chan,
 
 void *obmf_icp_get_response(struct obmf_icp_requester *req,
 			    u8 *statusp, size_t *lenp);
+
+void *obmf_icp_format_response(struct obmf_icp_channel_device *chan,
+			      struct obmf_icp_responder *rsp,
+			      u8 status, size_t payload_len);
+
+void obmf_icp_format_response_error(struct obmf_icp_channel_device *chan,
+				    struct obmf_icp_responder *rsp,
+				    u8 status);
+
+int obmf_icp_responder_tx(struct obmf_icp *icp,
+			  struct obmf_icp_responder *rsp);
+
+#define obmf_icp_format_response_typed(c, r, st, ty) \
+({ \
+	void *__p = obmf_icp_format_response((c), (r), (st), sizeof(ty)); \
+	(ty *)__p; \
+})
+
+#define obmf_icp_format_response_flex(c, r, st, ty, fam, count) \
+({ \
+	const size_t __c = (count); \
+	const size_t __size = struct_size_t(ty, fam, __c); \
+	void *__p = obmf_icp_format_response((c), (r), (st), __size); \
+	(ty *)__p; \
+})

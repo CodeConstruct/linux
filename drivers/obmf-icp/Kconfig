@@ -8,6 +8,18 @@ if OBMF_ICP
 
 menu "OBMF ICP transport drivers"
 
+config OBMF_ICP_TRANSPORT_USB
+	tristate "OBMF-ICP USB transport"
+	depends on USB
+	help
+	  USB transport driver for OBMF-ICP devices.
+
+	  This driver implements a USB class driver for OBMF-ICP devices,
+	  allowing I/O expansion over the host side of a USB connection,
+	  typically used for server platform management.
+
+	  If unsure, say 'n'
+
 endmenu
 
 menu "OMBF ICP channel drivers"

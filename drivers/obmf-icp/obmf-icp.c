@@ -83,13 +83,33 @@ static void obmf_icp_channel_device_remove(struct device *dev)
 
 static const struct bus_type obmf_icp_bus_type;
 
+static int
+obmf_icp_channel_driver_check_id(const struct obmf_icp_channel_device_id *id)
+{
+	/* disallow binding against the discovery channel */
+	if ((id->match_flags & OBMF_ICP_DEV_MATCH_TYPE) &&
+	    (id->type == OBMF_ICP_CHANNEL_TYPE_DISCOVERY)) {
+		return -1;
+	}
+
+	return 0;
+}
+
 int obmf_icp_channel_driver_register(struct obmf_icp_channel_driver *drv)
 {
+	const struct obmf_icp_channel_device_id *id;
+
 	if (!drv)
 		return -EINVAL;
 
 	if (!drv->id_table)
 		return -EINVAL;
+
+	for (id = drv->id_table; id->match_flags; id++) {
+		int rc = obmf_icp_channel_driver_check_id(id);
+		if (rc)
+			return rc;
+	}
 
 	drv->drv.bus = &obmf_icp_bus_type;
 
@@ -507,6 +527,227 @@ void obmf_icp_transport_tx_complete(struct obmf_icp *icp,
 	complete(&tx->completion);
 }
 
+static int obmf_icp_channel_configure(struct obmf_icp *icp,
+				      struct obmf_icp_channel_device *chan,
+				      u32 cfg_ptr)
+{
+	struct obmf_icp_ch0_channel_common config;
+	struct device *dev = &chan->dev;
+	u8 idx = chan->idx;
+	int rc;
+
+	chan->cfg_ptr = cfg_ptr;
+
+	/* read common channel header */
+	rc = obmf_icp_mmio_short_read(icp->ch0, chan->cfg_ptr,
+				      sizeof(config), &config);
+	if (rc) {
+		dev_warn(dev,
+			 "discovery read (chan %d common) failed: %d\n",
+			 idx, rc);
+		return rc;
+	}
+
+	if (config.idx != idx) {
+		dev_warn(dev, "invalid index (%d) for channel %d\n",
+			 config.idx, idx);
+		return -EINVAL;
+	}
+
+	if (config.type == OBMF_ICP_CHANNEL_TYPE_DISCOVERY) {
+		dev_warn(dev,
+			 "channel %d reports as discovery type, ignoring\n",
+			 idx);
+		return -EINVAL;
+	}
+
+	chan->type = config.type;
+	chan->cfg_size = le32_to_cpu(config.config_size);
+
+	// TODO: validate sizes
+	chan->max_req_payload_size = le16_to_cpu(config.max_req_payload_size);
+	chan->max_resp_payload_size = le16_to_cpu(config.max_resp_payload_size);
+
+	dev_dbg(&chan->dev, "idx %d, type %x, cfg_ptr 0x%x, cfg_size 0x%x\n",
+		chan->idx, chan->type, chan->cfg_ptr, chan->cfg_size);
+
+	scoped_guard(spinlock_irq, &icp->lock) {
+		icp->channels[idx] = chan;
+	}
+
+	rc = device_add(&chan->dev);
+	if (rc) {
+		dev_warn(dev,
+			 "device_add failed for idx %d\n", idx);
+		goto err_free;
+	}
+
+	return 0;
+
+err_free:
+	devm_kfree(dev, chan);
+	return rc;
+}
+
+struct obmf_icp_ch0_regs {
+	u8	ver_min;
+	u8	ver_maj;
+	__le16	vendor_id;
+	__le16	device_id;
+	u8	name[32];
+	u8	n_chans;
+	u8	config_status;
+	__le32	vendor_config_offset;
+} __packed;
+
+static void obmf_icp_ch0_discover_one(struct obmf_icp *icp, u8 idx,
+				      u32 cfg_addr)
+{
+	struct device *dev = obmf_icp_dev(icp);
+	struct obmf_icp_channel_device *chan;
+	int rc;
+
+	chan = obmf_icp_channel_init(icp, idx);
+	if (!chan) {
+		dev_warn(dev, "channel 0x%02x init failed\n", idx);
+		return;
+	}
+
+	rc = obmf_icp_channel_configure(icp, chan, cfg_addr);
+	if (rc) {
+		dev_warn(dev, "channel 0x%02x configuration failed\n", idx);
+		put_device(&icp->dev);
+		return;
+	}
+}
+
+static int obmf_icp_ch0_discover(struct obmf_icp *icp)
+{
+	struct device *dev = obmf_icp_dev(icp);
+	struct obmf_icp_channel_device **chans;
+	struct obmf_icp_ch0_regs regs;
+	u8 name[sizeof(regs.name)];
+	__le32 chan_ptrs[16];
+	unsigned int i;
+	int rc;
+
+	rc = obmf_icp_mmio_short_read(icp->ch0, 0, sizeof(regs), &regs);
+	if (rc) {
+		dev_warn(dev, "discovery read (header) failed: %d\n", rc);
+		return rc;
+	}
+
+	memcpy(name, regs.name, sizeof(name));
+	name[sizeof(name)-1] = '\0';
+
+	dev_info(dev,
+		 "ICP device: v:d %04x:%04x ver %d.%d, %s, %d channels\n",
+		 le16_to_cpu(regs.vendor_id), le16_to_cpu(regs.device_id),
+		 regs.ver_maj, regs.ver_min, name, regs.n_chans);
+
+	chans = devm_krealloc_array(dev, icp->channels, regs.n_chans + 1,
+				    sizeof(*chans), GFP_KERNEL);
+	if (!chans)
+		return -ENOMEM;
+
+	icp->channels = chans;
+	icp->n_channels = regs.n_chans + 1;
+
+	for (i = 0; i < regs.n_chans; i++) {
+		u8 idx = i + 1;
+		u32 chan_ptr;
+
+		if (!(i % ARRAY_SIZE(chan_ptrs))) {
+			unsigned int n = min(ARRAY_SIZE(chan_ptrs),
+					     regs.n_chans - i);
+			u16 ptr = sizeof(regs) + i * sizeof(chan_ptr);
+			rc = obmf_icp_mmio_short_read(icp->ch0, ptr,
+						      n * sizeof(*chan_ptrs),
+						      &chan_ptrs);
+			if (rc) {
+				dev_warn(dev,
+					 "discovery read (chan ptrs %d) failed: %d\n",
+					 i, rc);
+				return rc;
+			}
+		}
+
+		chan_ptr = le32_to_cpu(chan_ptrs[i % ARRAY_SIZE(chan_ptrs)]);
+
+		if (!chan_ptr) {
+			dev_warn(dev,
+				 "discovery: chan %d reports unimplemented",
+				 idx);
+			continue;
+		}
+
+		obmf_icp_ch0_discover_one(icp, idx, chan_ptr);
+	}
+
+	return 0;
+}
+
+/* channel configuration access */
+int obmf_icp_channel_config_read(struct obmf_icp_channel_device *chan,
+				 u32 addr, u16 size, void *data)
+{
+	struct obmf_icp *icp = chan->icp;
+	u32 end, offset;
+
+	/* todo: overflow */
+	end = sizeof(struct obmf_icp_ch0_channel_common) + chan->cfg_size;
+
+	if (addr >= end || addr + size > end)
+		return -EINVAL;
+
+	offset = chan->cfg_ptr + addr;
+
+	return obmf_icp_mmio_short_read(icp->ch0, offset, size, data);
+}
+
+int obmf_icp_channel_config_write(struct obmf_icp_channel_device *chan,
+				  u32 addr, u16 size, const void *data)
+{
+	struct obmf_icp *icp = chan->icp;
+	u32 end, offset;
+
+	/* todo: overflow */
+	end = sizeof(struct obmf_icp_ch0_channel_common) + chan->cfg_size;
+	if (addr >= end || addr + size > end)
+		return -EINVAL;
+
+	offset = chan->cfg_ptr + addr;
+
+	return obmf_icp_mmio_short_write(icp->ch0, offset, size, data);
+}
+
+#define OBMF_ICP_CHANNEL_CONTROL_ENABLE	(1<<0)
+
+static int __obmf_icp_channel_set_enable(struct obmf_icp_channel_device *chan,
+					 bool enable)
+{
+	u32 addr = offsetof(struct obmf_icp_ch0_channel_common, control);
+	u8 ctrl = 0;
+
+	/* todo: configuration lock bit? */
+	if (enable)
+		ctrl |= OBMF_ICP_CHANNEL_CONTROL_ENABLE;
+
+	chan->enabled = enable;
+
+	return obmf_icp_channel_config_write(chan, addr, sizeof(ctrl), &ctrl);
+}
+
+int obmf_icp_channel_enable(struct obmf_icp_channel_device *chan)
+{
+	return __obmf_icp_channel_set_enable(chan, true);
+}
+
+int obmf_icp_channel_disable(struct obmf_icp_channel_device *chan)
+{
+	return __obmf_icp_channel_set_enable(chan, false);
+}
+
 static int obmf_icp_ch0_init(struct obmf_icp *icp)
 {
 	struct obmf_icp_channel_device *ch0;
@@ -619,7 +860,11 @@ int obmf_icp_bus_register(struct obmf_icp *icp)
 		goto err_cancel;
 	}
 
-	/* todo: discover channels */
+	rc = obmf_icp_ch0_discover(icp);
+	if (rc) {
+		dev_err(dev, "channel discovery failed\n");
+		goto err_cancel;
+	}
 
 	return 0;
 

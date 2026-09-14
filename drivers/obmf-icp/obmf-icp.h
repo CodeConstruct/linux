@@ -64,6 +64,24 @@ static inline void obmf_icp_msg_get_status_rq(struct obmf_icp_msg_hdr *hdr,
 		*rq = FIELD_GET(OBMF_ICP_MSG_HDR_RQRESP_FIELD, status_rq);
 }
 
+/* discovery */
+struct obmf_icp_ch0_channel_common {
+	u8	type;
+	u8	idx;
+	u8	name[16];
+	u8	role;
+	u8	health_status;
+	u8	control;
+	u8	channel_specific_status;
+	u8	channel_specific_control;
+	__le16	max_req_payload_size;
+	__le16	max_resp_payload_size;
+	u8	rsvd;
+	__le32	config_size;
+} __packed;
+
+#define OBMF_ICP_CH0_CONFIG_CHANNEL_SPECIFIC_OFFSET 0x20
+
 /* OBMF-ICP implementation */
 struct obmf_icp;
 struct obmf_icp_tx;
@@ -345,3 +363,23 @@ int obmf_icp_responder_tx(struct obmf_icp *icp,
 	void *__p = obmf_icp_format_response((c), (r), (st), __size); \
 	(ty *)__p; \
 })
+
+/* configuration facility for channel drivers */
+int obmf_icp_channel_config_read(struct obmf_icp_channel_device *chan, u32 addr,
+				 u16 size, void *data);
+int obmf_icp_channel_config_write(struct obmf_icp_channel_device *chan, u32 addr,
+				  u16 size, const void *data);
+
+int obmf_icp_channel_enable(struct obmf_icp_channel_device *chan);
+int obmf_icp_channel_disable(struct obmf_icp_channel_device *chan);
+
+/* MMIO */
+struct obmf_icp_channel_mmio;
+int obmf_icp_mmio_channel_init(struct obmf_icp_channel_device *chan,
+			       struct obmf_icp_channel_mmio **mmio);
+int obmf_icp_mmio_ch0_init(struct obmf_icp_channel_device **chanp,
+			   struct obmf_icp_channel_mmio **mmiop);
+int obmf_icp_mmio_short_read(struct obmf_icp_channel_device *mmio,
+			     u32 addr, u16 len, void *data);
+int obmf_icp_mmio_short_write(struct obmf_icp_channel_device *mmio,
+			      u32 addr, u16 len, const void *data);

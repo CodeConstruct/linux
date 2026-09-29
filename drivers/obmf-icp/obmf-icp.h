@@ -160,6 +160,8 @@ struct obmf_icp {
 int obmf_icp_bus_register(struct obmf_icp *icp);
 void obmf_icp_bus_unregister(struct obmf_icp *icp);
 
+struct obmf_icp_requester;
+
 /* channel / device types */
 struct obmf_icp_channel_device {
 	struct device dev;
@@ -174,6 +176,9 @@ struct obmf_icp_channel_device {
 	bool enabled;
 
 	struct obmf_icp *icp;
+
+	/* access via obmf_icp_channel_get_requester() */
+	struct obmf_icp_requester *req;
 };
 
 /* context for request / response transmit */
@@ -193,6 +198,14 @@ struct obmf_icp_rx {
 	size_t len;
 	int status;
 	struct completion completion;
+};
+
+/* requester context, with facility to transmit then receive */
+struct obmf_icp_requester {
+	struct mutex mutex;
+	struct obmf_icp_tx tx;
+	struct obmf_icp_rx rx;
+	void *transport_data;
 };
 
 struct obmf_icp_channel_device_id {
@@ -234,3 +247,34 @@ obmf_icp_set_drvdata(struct obmf_icp_channel_device *dev, void *data)
 {
 	dev_set_drvdata(&dev->dev, data);
 }
+
+int obmf_icp_channel_init_requester(struct obmf_icp_channel_device *chan);
+
+int obmf_icp_requester_txn(struct obmf_icp *icp,
+			   struct obmf_icp_requester *req);
+
+struct obmf_icp_requester *
+obmf_icp_channel_get_requester(struct obmf_icp_channel_device *chan);
+
+void obmf_icp_channel_put_requester(struct obmf_icp_requester *req);
+
+void *obmf_icp_format_request(struct obmf_icp_channel_device *chan,
+			      struct obmf_icp_requester *req,
+			      size_t payload_len);
+
+#define obmf_icp_format_request_typed(c, r, ty) \
+({ \
+	void *__p = obmf_icp_format_request((c), (r), sizeof(ty)); \
+	(ty *)__p; \
+})
+
+#define obmf_icp_format_request_flex(c, r, ty, fam, count) \
+({ \
+	const size_t __c = (count); \
+	const size_t __size = struct_size_t(ty, fam, __c); \
+	void *__p = obmf_icp_format_request((c), (r), __size); \
+	(ty *)__p; \
+})
+
+void *obmf_icp_get_response(struct obmf_icp_requester *req,
+			    u8 *statusp, size_t *lenp);

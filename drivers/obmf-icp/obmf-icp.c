@@ -66,15 +66,30 @@ static int obmf_icp_channel_device_probe(struct device *dev)
 	return chan_drv->probe(chan_dev);
 }
 
+static void obmf_icp_requester_kref_release(struct kref *kref);
+
 static void obmf_icp_channel_device_remove(struct device *dev)
 {
 	struct obmf_icp_channel_driver *chan_drv = to_obmf_icp_drv(dev->driver);
 	struct obmf_icp_channel_device *chan_dev = to_obmf_icp_dev(dev);
+	struct obmf_icp_requester *req = NULL;
+	struct obmf_icp *icp = chan_dev->icp;
+	struct obmf_icp_transport *ts = icp->transport;
 
 	if (chan_drv->remove)
 		chan_drv->remove(chan_dev);
 
 	obmf_icp_channel_disable(chan_dev);
+
+	scoped_guard(spinlock_irq, &icp->lock) {
+		swap(chan_dev->req, req);
+	}
+
+	if (req) {
+		if (ts->ops->tx_cancel)
+			ts->ops->tx_cancel(icp, &req->tx);
+		kref_put(&req->kref, obmf_icp_requester_kref_release);
+	}
 }
 
 static int __obmf_icp_channel_set_enable(struct obmf_icp_channel_device *chan,
@@ -129,6 +144,164 @@ static void obmf_icp_channel_device_release(struct device *dev)
 	struct obmf_icp_channel_device *chan = to_obmf_icp_dev(dev);
 
 	kfree(chan);
+}
+
+static void obmf_icp_requester_kref_release(struct kref *kref)
+{
+	struct obmf_icp_requester *req =
+		container_of(kref, struct obmf_icp_requester, kref);
+
+	kfree(req);
+}
+
+int obmf_icp_channel_init_requester(struct obmf_icp_channel_device *chan)
+{
+	struct obmf_icp_transport *ts = chan->icp->transport;
+	struct obmf_icp_requester *req;
+	int rc;
+
+	req = kmalloc_obj(*req, GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+
+	init_completion(&req->tx.completion);
+	init_completion(&req->rx.completion);
+	kref_init(&req->kref);
+	mutex_init(&req->mutex);
+	req->rx.chan = chan;
+
+	if (ts->ops->tx_init) {
+		rc = ts->ops->tx_init(ts, &req->tx);
+		if (rc) {
+			dev_err(&chan->dev, "tx init failed: %d\n", rc);
+			goto err_free;
+		}
+	}
+
+	rc = 0;
+
+	scoped_guard(spinlock_irq, &chan->icp->lock) {
+		if (chan->enabled || chan->req)
+			rc = -EBUSY;
+		else
+			chan->req = req;
+	}
+
+	if (rc) {
+		dev_err(&chan->dev,
+			"channel in invalid state to init requester");
+		goto err_fini;
+	}
+
+	return 0;
+
+err_fini:
+	if (ts->ops->tx_fini)
+		ts->ops->tx_fini(ts, &req->tx);
+err_free:
+	kfree(req);
+	return rc;
+}
+
+struct obmf_icp_requester *
+obmf_icp_channel_get_requester(struct obmf_icp_channel_device *chan)
+{
+	struct obmf_icp_requester *req;
+
+	scoped_guard(spinlock_irq, &chan->icp->lock) {
+		if (!chan->enabled)
+			return NULL;
+
+		if (!chan->req)
+			return NULL;
+
+		req = chan->req;
+		kref_get(&req->kref);
+	}
+
+	mutex_lock(&chan->req->mutex);
+
+	return chan->req;
+}
+
+void obmf_icp_channel_put_requester(struct obmf_icp_requester *req)
+{
+	mutex_unlock(&req->mutex);
+	kref_put(&req->kref, obmf_icp_requester_kref_release);
+}
+
+/* len is total message length, including ICP header. returns a payload
+ * pointer, of @payload_len bytes
+ */
+static void *obmf_icp_format_tx(struct obmf_icp_channel_device *chan,
+				struct obmf_icp_tx *tx, u8 status_rq,
+				size_t payload_len, u16 max_len)
+{
+	struct obmf_icp_msg_hdr *hdr;
+	size_t len;
+
+	if (payload_len > U16_MAX)
+		return ERR_PTR(-EMSGSIZE);
+
+	len = payload_len + sizeof(*hdr);
+
+	if (len > sizeof(tx->buf) || len > max_len) {
+		dev_err(&chan->dev,
+			"tx too large: requested %zd, buf max %zd, chan max %d\n",
+			len, sizeof(tx->buf), max_len);
+		return ERR_PTR(-EMSGSIZE);
+	}
+
+	memset(tx->buf, 0, payload_len + sizeof(*hdr));
+	hdr = (void *)tx->buf;
+
+	hdr->channel = chan->idx;
+	hdr->status_rq = status_rq;
+	hdr->size = cpu_to_le16(payload_len);
+	tx->len = payload_len + sizeof(*hdr);
+
+	return tx->buf + sizeof(*hdr);
+}
+
+/* returns a payload pointer, of len *lenp */
+static void *obmf_icp_get_rx(struct obmf_icp_rx *rx, u8 *statusp, size_t *lenp)
+{
+	struct obmf_icp_msg_hdr *hdr = (void *)rx->buf;
+	size_t len = rx->len;
+
+	if (len < sizeof(*hdr)) {
+		/* we will have checked for a valid message on receive,
+		 * so the caller would not have completed the rx.
+		 */
+		pr_err("invalid length %zd, corrupt requester?\n", len);
+		return ERR_PTR(-EIO);
+	}
+
+	if (lenp)
+		*lenp = len - sizeof(*hdr);
+
+	if (statusp)
+		*statusp = FIELD_GET(OBMF_ICP_MSG_HDR_STATUS_FIELD,
+				     hdr->status_rq);
+
+	return rx->buf + sizeof(*hdr);
+}
+
+void *obmf_icp_format_request(struct obmf_icp_channel_device *chan,
+			      struct obmf_icp_requester *req,
+			      size_t payload_len)
+{
+	u8 status_rq = FIELD_PREP(OBMF_ICP_MSG_HDR_RQRESP_FIELD,
+				  OBMF_ICP_MSG_HDR_RQRESP_VALUE_REQUEST);
+
+	return obmf_icp_format_tx(chan, &req->tx, status_rq,
+				  payload_len, chan->max_req_payload_size);
+}
+
+void *obmf_icp_get_response(struct obmf_icp_requester *req,
+			    u8 *statusp, size_t *lenp)
+{
+	return obmf_icp_get_rx(&req->rx, statusp, lenp);
 }
 
 static struct obmf_icp_channel_device *
@@ -188,10 +361,17 @@ static void __obmf_icp_handle_rx(struct obmf_icp *icp, size_t len)
 			chan_idx);
 		return;
 	} else {
-		dev_err(dev,
-			"requester not implemented, channel %d\n",
-			chan_idx);
-		return;
+		struct obmf_icp_requester *req = chan->req;
+
+		if (!req) {
+			dev_err(dev,
+				"invalid response for non-requester channel %d\n",
+				chan_idx);
+			return;
+		}
+		req->rx.len = len;
+		memcpy(req->rx.buf, icp->in_buf, req->rx.len);
+		complete(&req->rx.completion);
 	}
 }
 
@@ -225,6 +405,44 @@ void obmf_icp_transport_rx_complete(struct obmf_icp *icp, int status,
 	}
 }
 
+/* TODO: check enabled and present */
+int obmf_icp_requester_txn(struct obmf_icp_channel_device *chan,
+			   struct obmf_icp_requester *req)
+{
+	struct obmf_icp_tx *tx = &req->tx;
+	struct obmf_icp_rx *rx = &req->rx;
+	struct obmf_icp *icp = chan->icp;
+	int rc;
+
+	if (WARN_ONCE(!mutex_is_locked(&req->mutex), "txn with req unlocked"))
+		return -EINVAL;
+
+	reinit_completion(&rx->completion);
+	reinit_completion(&tx->completion);
+
+	rc = icp->transport->ops->tx_submit(icp, tx);
+	if (rc)
+		return rc;
+
+	rc = wait_for_completion_interruptible(&tx->completion);
+	if (rc) {
+		if (icp->transport->ops->tx_cancel)
+			icp->transport->ops->tx_cancel(icp, tx);
+		return -EPROTO;
+	}
+
+	if (tx->status != 0) {
+		dev_warn(&icp->dev, "tx status %d\n", tx->status);
+		return tx->status;
+	}
+
+	rc = wait_for_completion_interruptible(&rx->completion);
+	if (rc)
+		return -EPROTO;
+
+	return 0;
+}
+
 void obmf_icp_transport_tx_complete(struct obmf_icp *icp,
 				    struct obmf_icp_tx *tx)
 {
@@ -245,9 +463,9 @@ static int obmf_icp_ch0_init(struct obmf_icp *icp)
 	ch0->type = OBMF_ICP_CHANNEL_TYPE_DISCOVERY;
 	ch0->cfg_ptr = 0;
 	ch0->cfg_size = 0;
-	ch0->enabled = true;
 
 	scoped_guard(spinlock_irq, &icp->lock) {
+		ch0->enabled = true;
 		icp->channels[0] = ch0;
 		icp->ch0 = ch0;
 	}
